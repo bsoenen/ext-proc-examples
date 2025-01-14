@@ -4,13 +4,11 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"io"
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -26,17 +24,6 @@ import (
 var (
 	grpcport = flag.String("grpcport", ":18080", "grpcport")
 )
-
-type Instructions struct {
-	// Header key/value pairs to add to the request or response.
-	AddHeaders map[string]string `json:"addHeaders"`
-	// Header keys to remove from the request or response.
-	RemoveHeaders []string `json:"removeHeaders"`
-	// Set the body of the request or response to the specified string. If empty, will be ignored.
-	SetBody string `json:"setBody"`
-	// Set the request or response trailers.
-	SetTrailers map[string]string `json:"setTrailers"`
-}
 
 type server struct{}
 
@@ -78,7 +65,7 @@ func (s *server) Process(srv service_ext_proc_v3.ExternalProcessor_ProcessServer
 			log.Printf("Got RequestHeaders")
 
 			h := req.Request.(*service_ext_proc_v3.ProcessingRequest_RequestHeaders)
-			headersResp, err := getHeadersResponseFromInstructions(h.RequestHeaders)
+			headersResp, err := getApiVersionHeadersResponse(h.RequestHeaders, false)
 			if err != nil {
 				return err
 			}
@@ -98,7 +85,7 @@ func (s *server) Process(srv service_ext_proc_v3.ExternalProcessor_ProcessServer
 			log.Printf("Got ResponseHeaders")
 
 			h := req.Request.(*service_ext_proc_v3.ProcessingRequest_ResponseHeaders)
-			headersResp, err := getHeadersResponseFromInstructions(h.ResponseHeaders)
+			headersResp, err := getApiVersionHeadersResponse(h.ResponseHeaders, true)
 			if err != nil {
 				return err
 			}
@@ -163,86 +150,63 @@ func main() {
 	}
 }
 
-func getInstructionsFromHeaders(in *service_ext_proc_v3.HttpHeaders) string {
+func getApiVersionFromHeaders(in *service_ext_proc_v3.HttpHeaders) string {
 	for _, n := range in.Headers.Headers {
-		if n.Key == "instructions" {
+		if n.Key == "api-version" {
 			return string(n.RawValue)
 		}
 	}
 	return ""
 }
 
-func getHeadersResponseFromInstructions(in *service_ext_proc_v3.HttpHeaders) (*service_ext_proc_v3.HeadersResponse, error) {
-	instructionString := getInstructionsFromHeaders(in)
-
-	// no instructions were sent, so don't modify anything
-	if instructionString == "" {
-		return &service_ext_proc_v3.HeadersResponse{}, nil
+func checkApiVersionHeader(apiversion string) bool {
+	// return true  if apiversion is   valid
+	//        false if apiversion is invalid
+	for _, n := range [3]string{"2024-11", "2024-12", "2025-01"} { // XXX hardcoded
+		if apiversion == n {
+			log.Printf("API version header is: %s.", apiversion)
+			return true
+		}
 	}
+	log.Printf("No, invalid or deprecated API version header ('%s').", apiversion)
+	return false
+}
 
-	var instructions *Instructions
-	err := json.Unmarshal([]byte(instructionString), &instructions)
-	if err != nil {
-		log.Printf("Error unmarshalling instructions: %v", err)
-		return nil, err
-	}
+func getApiVersionHeadersResponse(in *service_ext_proc_v3.HttpHeaders, responseHeader bool) (*service_ext_proc_v3.HeadersResponse, error) {
+	apiVersionString := getApiVersionFromHeaders(in)
 
 	// build the response
 	resp := &service_ext_proc_v3.HeadersResponse{
 		Response: &service_ext_proc_v3.CommonResponse{},
 	}
 
-	// headers
-	if len(instructions.AddHeaders) > 0 || len(instructions.RemoveHeaders) > 0 {
+	if responseHeader {
+		log.Printf("Parsing response headers.")
+	} else {
+		log.Printf("Parsing request headers.")
+	}
+
+	// no api-version were sent, return default
+	if !checkApiVersionHeader(apiVersionString) {
+		log.Printf("Return default API version header.")
 		var addHeaders []*core_v3.HeaderValueOption
-		for k, v := range instructions.AddHeaders {
+		addHeaders = append(addHeaders, &core_v3.HeaderValueOption{
+			Header: &core_v3.HeaderValue{Key: "api-version", RawValue: []byte("2024-11")}, // XXX hardcoded
+		})
+		if responseHeader {
+			// Set "deprecation", "sunset" and "link" headers in case of response
 			addHeaders = append(addHeaders, &core_v3.HeaderValueOption{
-				Header: &core_v3.HeaderValue{Key: k, RawValue: []byte(v)},
+				Header: &core_v3.HeaderValue{Key: "deprecation", RawValue: []byte("@1688169599")}, // XXX hardcoded
+			})
+			addHeaders = append(addHeaders, &core_v3.HeaderValueOption{
+				Header: &core_v3.HeaderValue{Key: "sunset", RawValue: []byte("Sun, 30 Jun 2024 23:59:59 GMT")}, // XXX hardcoded
+			})
+			addHeaders = append(addHeaders, &core_v3.HeaderValueOption{
+				Header: &core_v3.HeaderValue{Key: "link", RawValue: []byte("<https://example.com/apis/deprecation>; rel=\"deprecation\"; type=\"text/html\"")},
 			})
 		}
 		resp.Response.HeaderMutation = &service_ext_proc_v3.HeaderMutation{
-			SetHeaders:    addHeaders,
-			RemoveHeaders: instructions.RemoveHeaders,
-		}
-	}
-
-	// body
-	if instructions.SetBody != "" {
-		body := []byte(instructions.SetBody)
-
-		if resp.Response.HeaderMutation == nil {
-			resp.Response.HeaderMutation = &service_ext_proc_v3.HeaderMutation{}
-		}
-		resp.Response.HeaderMutation.SetHeaders = append(resp.Response.HeaderMutation.SetHeaders,
-			[]*core_v3.HeaderValueOption{
-				{
-					Header: &core_v3.HeaderValue{
-						Key:   "content-type",
-						Value: "text/plain",
-					},
-				},
-				{
-					Header: &core_v3.HeaderValue{
-						Key:   "Content-Length",
-						Value: strconv.Itoa(len(body)),
-					},
-				},
-			}...)
-		resp.Response.BodyMutation = &service_ext_proc_v3.BodyMutation{
-			Mutation: &service_ext_proc_v3.BodyMutation_Body{
-				Body: body,
-			},
-		}
-	}
-
-	// trailers
-	if len(instructions.SetTrailers) > 0 {
-		var setTrailers []*core_v3.HeaderValue
-		for k, v := range instructions.SetTrailers {
-			setTrailers = append(setTrailers, &core_v3.HeaderValue{Key: k, Value: v})
-		}
-		resp.Response.Trailers = &core_v3.HeaderMap{
-			Headers: setTrailers,
+			SetHeaders: addHeaders,
 		}
 	}
 
